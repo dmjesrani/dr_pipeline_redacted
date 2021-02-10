@@ -1,0 +1,373 @@
+env.git_url = 'git@github.com:xxxxxxx-xxxxxxxx/xxxxxxxxxx-xxxxxxx.git'
+env.git_branch = 'master'
+env.credentials_id = '6d16c1de-d3b2-4e77-b5fe-2801a009ab65'
+env.terraform_version = '0.13.5'
+env.repos2 = ['xxxx-meta','xxxx-data']
+
+/* BAD IDEA -- remove this for prod */
+// env.TOKEN = credentials('Terraform_APIKEY')
+
+pipeline {
+agent { label 'docker-agent-2' }
+
+stages {
+    
+stage('Set SSHID env var') {
+  steps {
+    script {
+         env.SSHKEYID = sh (script: 
+         '''
+         case ${xxxx_Environment} in
+          DR1)
+            echo "f08498e9-3985-4405-af04-fe5d4a1eefe4"
+            ;;
+          PF1)
+   	       echo "c07d73ae-1f5d-4a3b-b261-3d2eaf21fff0"
+            ;;
+          PF2)
+           echo "c07d73ae-1f5d-4a3b-b261-3d2eaf21fff0"
+            ;;
+          esac
+         ''',returnStdout: true).trim()
+    }
+    script {
+      env.LOWENV = sh (script: 'echo ${xxxx_Environment} | tr \'[:upper:]\' \'[:lower:]\'',
+               returnStdout: true).trim()
+    }
+    
+  }
+} // *End env var setup
+
+
+stage('Prepare Build') {
+  steps {
+  git branch: "$git_branch",
+  credentialsId: "$credentials_id",
+  url: "$git_url"
+  sh '''
+      curl -o terraform.zip https://releases.hashicorp.com/terraform/${terraform_version}/terraform_${terraform_version}_linux_amd64.zip
+      unzip terraform.zip
+      chmod +x ./terraform    '''   
+      }
+  
+} // *End prepare
+
+
+stage('Init') {
+  steps {
+    withCredentials([string(credentialsId: 'Terraform_APIKEY', variable: 'TOKEN'), file(credentialsId: '355f3b12-22c3-45c8-b127-3265aa706eee', variable: 'AWS_SHARED_CREDENTIALS_FILE')
+        ]) {
+    dir("${env.WORKSPACE}/tf/AWS/Environments/${xxxx_Environment}"){
+    sh 'pwd'
+    sh '${WORKSPACE}/terraform --version'
+    sh '${WORKSPACE}/terraform init -no-color -backend-config="token=$TOKEN"'
+        }
+      }
+    }
+} // *End init
+
+
+stage('Plan') {
+  steps {
+        withCredentials([string(credentialsId: 'Terraform_APIKEY', variable: 'TOKEN'), file(credentialsId: '355f3b12-22c3-45c8-b127-3265aa706eee', variable: 'AWS_SHARED_CREDENTIALS_FILE')
+        ]) {
+        dir("${env.WORKSPACE}/tf/AWS/Environments/${xxxx_Environment}"){
+            
+        script {
+            def plan_status = sh(returnStatus: true, script: "$WORKSPACE/terraform plan -var ifs_snapshot_id=${params.IFS_snap_id} -var mongo_snapshot_id=${params.mongo_snap_id} -var rds_snapshot=${params.RDS_snap_id} -no-color -out=plan.out -detailed-exitcode" )
+            if (plan_status == 0) {
+                currentBuild.result = 'SUCCESS'
+                echo "No Change detected - Exiting"
+                return
+            } 
+          }
+        } // end dir
+        }
+      }
+} // * End Plan - IF PLAN Set status to SUCCESS EXIT the pipeline
+
+
+
+stage('TF Apply') {
+    when {
+       expression { currentBuild.result != 'SUCCESS' }
+        } 
+      steps {
+      withCredentials([string(credentialsId: 'Terraform_APIKEY', variable: 'TOKEN'), file(credentialsId: '355f3b12-22c3-45c8-b127-3265aa706eee', variable: 'AWS_SHARED_CREDENTIALS_FILE')]) {
+      dir("${env.WORKSPACE}/tf/AWS/Environments/${xxxx_Environment}") {
+        sh '$WORKSPACE/terraform apply -auto-approve -no-color -input=false plan.out'
+      } //* close dir
+    } //* close credentials
+  }
+} // End Apply
+
+
+
+stage ('Run Ansible Cluster Bootstrap') {
+  steps {
+       
+      echo "${LOWENV}"
+                ansiblePlaybook(
+                    credentialsId: "${SSHKEYID}",
+                    vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+                    disableHostKeyChecking: 'true',
+                    inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+                    installation: 'Ansible',
+                    playbook: '${WORKSPACE}/playbooks/cluster_bootstrap_autodisk.yml'
+                )
+            
+  }
+} //*close cluster bootstrap stage
+
+
+stage ('Deploy Vault') {
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-vault'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //*close deploy Vault stage*//
+
+
+stage ('Bootstrap Vault') {
+  steps {
+       
+      echo "${LOWENV}"
+                ansiblePlaybook(
+                    credentialsId: "${SSHKEYID}",
+                    vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+                    disableHostKeyChecking: 'true',
+                    inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+                    installation: 'Ansible',
+                    playbook: '${WORKSPACE}/playbooks/vault_config.yml'
+                )
+      script {
+        env.NOMADTOKEN = sh (script: "cat ~/keys/nomad_lease.txt | jq '.auth.client_token'",
+               returnStdout: true).trim()
+      }
+      sh "cat ~/keys/nomad_lease.txt | jq '.auth.client_token'"
+      sh 'echo ${NOMADTOKEN}'
+
+      script {
+        env.ROOTTOKEN = sh (script: "cat ~/keys/keys.txt | jq '.root_token' | tr -d '\"'",
+               returnStdout: true).trim()
+      }
+
+      sh "cat ~/keys/keys.txt | jq '.root_token' | tr -d '\"'"
+      sh 'echo ${ROOTTOKEN}'
+
+      echo "${LOWENV}"
+                ansiblePlaybook(
+                    credentialsId: "${SSHKEYID}",
+                    vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+                    disableHostKeyChecking: 'true',
+                    inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+                    installation: 'Ansible',
+                    playbook: '${WORKSPACE}/playbooks/bootstrap_cluster/nomad_install.yml',
+                    extras: "--extra-vars 'nomad_vault_token=${NOMADTOKEN}'"
+                )
+  }
+} //*close bootstrap Vault stage*/
+
+
+stage ('Deploy Mongo DB') {
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-mongo'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //*close deploy Mongo DB stage*//
+
+
+//* insert some pause here *//
+
+stage ("Pause for 45 seconds before replica set reconfig") {
+
+  steps {
+  echo 'Waiting 45 seconds for deployment to complete'
+  sleep 45 // seconds
+  }
+}
+
+
+stage ('Reconfigure Mongo Replica Set') {
+  steps {
+      
+      echo "${LOWENV}"
+                ansiblePlaybook(
+                    credentialsId: "${SSHKEYID}",
+                    vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+                    disableHostKeyChecking: 'true',
+                    inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+                    installation: 'Ansible',
+                    playbook: '${WORKSPACE}/playbooks/autodeploy_update_mongo.yml'
+                )
+  }
+} //*close reconfig Mongo replica set stage*//
+
+
+stage ('Clear out /var/lib/mysql on services') {
+  steps {
+      echo "${LOWENV}"
+                ansiblePlaybook(
+                    credentialsId: "${SSHKEYID}",
+                    vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+                    disableHostKeyChecking: 'true',
+                    inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+                    installation: 'Ansible',
+                    playbook: '${WORKSPACE}/playbooks/autodeploy_clear_mysql_data.yml'
+                )
+  }
+} //*close clear out /var/lib/mysql stage*/
+
+//* insert some pause here *//
+
+stage ("Pause for 10 seconds before deploying MySQLdump container") {
+
+  steps {
+  echo 'Waiting 10 seconds until deployment'
+  sleep 10 // seconds
+  }
+}
+
+
+//* deploy this container to either update RDS or to dump FROM RDS
+
+stage ('Deploy MySQdump Container to update or dump from RDS') {
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-mysqldump'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //*end deploy MySQLdump container
+
+// if database choice is local
+
+
+stage ('Register RDS with Consul as a service') {
+  
+  steps {
+      echo "${LOWENV}"
+      ansiblePlaybook(
+          credentialsId: "${SSHKEYID}",
+          vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+          disableHostKeyChecking: 'true',
+          inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+          installation: 'Ansible',
+          playbook: '${WORKSPACE}/playbooks/bootstrap_cluster/consul_externalservices.yml'
+      )     
+  }
+} //*close register RDS with Consul *//
+
+stage ('Update RDS with new Keycloak values') {
+
+  steps {
+      echo "${LOWENV}"
+      ansiblePlaybook(
+          credentialsId: "${SSHKEYID}",
+          vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+          disableHostKeyChecking: 'true',
+          inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+          installation: 'Ansible',
+          playbook: '${WORKSPACE}/playbooks/autodeploy_update_keycloak.yml'
+      )     
+  }
+} //*close Update Keycloak on RDS stage*//
+
+
+stage ('Stop mysqldump') {
+    
+  steps {
+    echo "${LOWENV}"
+    build job: 'Stop a Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-mysqldump'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //* end Stop mysqldump
+
+
+stage ("Pause for 15 seconds before deploying Keycloak") {
+
+  steps {
+  echo 'Waiting 15 seconds until deployment'
+  sleep 15 // seconds
+  }
+}
+
+stage ('Deploy Keycloak') {
+    
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-keycloak'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //* end deploy keycloak stage
+
+stage ('Get ALB endpoint and update Route 53') {
+  steps {
+    echo "${LOWENV}"
+    ansiblePlaybook(
+        credentialsId: "${SSHKEYID}",
+        vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+        disableHostKeyChecking: 'true',
+        inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+        installation: 'Ansible',
+        playbook: '${WORKSPACE}/playbooks/autodeploy_get_ALB_and_update_rt53.yml'
+    )
+  }
+} //*close update Route 53 stage*//
+
+
+stage ('Update Consul with Prod Client Secret') {
+  steps {
+    echo "${LOWENV}"
+    ansiblePlaybook(
+        credentialsId: "${SSHKEYID}",
+        vaultCredentialsId: '6270c6a2-2af4-4e3b-9eec-8e83cc2a2b2a',
+        disableHostKeyChecking: 'true',
+        inventory: '${WORKSPACE}/inventories/aws/'+"${LOWENV}",
+        installation: 'Ansible',
+        playbook: '${WORKSPACE}/playbooks/autodeploy_update_consul.yml'
+    )
+  }
+} //*close update Consul stage*//
+
+
+stage ('Deploy Hashi-UI') {
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-hashi-ui'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //*close deploy Hashi UI stage*//
+
+
+stage ('Deploy Traefik') {
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-traefikAll'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //*close deploy Traefik stage*//
+
+
+stage ('Deploy RabbitMQ') {
+  steps {
+    echo "${LOWENV}"
+    build job: 'Deploy Non-App Service',parameters: [[$class: 'StringParameterValue', name: 'SERVICE', value: 'services-rabbitmq'], [$class: 'StringParameterValue', name: 'TARGETCLUSTER', value: 'aws_'+"${LOWENV}"]]
+  }
+} //*close deploy RabbitMQ stage*//
+
+
+stage('Deploy xxxx-II') {
+  steps {
+    withCredentials([string(credentialsId: 'Terraform_APIKEY', variable: 'TOKEN'), file(credentialsId: '355f3b12-22c3-45c8-b127-3265aa706eee', variable: 'AWS_SHARED_CREDENTIALS_FILE')
+        ]) {
+    dir("${env.WORKSPACE}"){
+    sh '''
+      curl -L https://github.com/mikefarah/yq/releases/download/2.4.0/yq_linux_amd64 --output yq
+      chmod +x ./yq
+      sudo cp yq /usr/local/bin
+      . scripts/jenkins_deploy_xxxx.sh dr1 '''
+        }
+      }
+    }
+} // *End Deploy xxxx-II
+
+
+}//*close stages*//
+
+
+}//*close pipeline*//

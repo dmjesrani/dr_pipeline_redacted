@@ -4,8 +4,6 @@ env.credentials_id = '6d16c1de-d3b2-4e77-b5fe-2801a009ab65'
 env.terraform_version = '0.13.5'
 env.repos2 = ['xxxx-meta','xxxx-data']
 
-/* BAD IDEA -- remove this for prod */
-// env.TOKEN = credentials('Terraform_APIKEY')
 
 pipeline {
 agent { label 'docker-agent-2' }
